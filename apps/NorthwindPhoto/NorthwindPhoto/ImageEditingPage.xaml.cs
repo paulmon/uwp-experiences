@@ -10,11 +10,19 @@
 // THE CODE OR THE USE OR OTHER DEALINGS IN THE CODE.
 // ******************************************************************
 
+using Microsoft.Graphics.Canvas;
+using Microsoft.Graphics.Canvas.Effects;
+using Microsoft.Graphics.Canvas.UI;
+using Microsoft.Graphics.Canvas.UI.Xaml;
+using NorthwindPhoto.Model;
 using System;
 using System.Linq;
 using System.Numerics;
+using System.Threading;
 using System.Threading.Tasks;
+using Windows.Devices.Gpio;
 using Windows.Foundation;
+using Windows.System;
 using Windows.UI.Composition;
 using Windows.UI.Input;
 using Windows.UI.Popups;
@@ -24,12 +32,6 @@ using Windows.UI.Xaml.Hosting;
 using Windows.UI.Xaml.Input;
 using Windows.UI.Xaml.Media;
 using Windows.UI.Xaml.Navigation;
-using Microsoft.Graphics.Canvas;
-using Microsoft.Graphics.Canvas.Effects;
-using Microsoft.Graphics.Canvas.UI;
-using Microsoft.Graphics.Canvas.UI.Xaml;
-using NorthwindPhoto.Model;
-using Windows.System;
 
 namespace NorthwindPhoto
 {
@@ -55,11 +57,33 @@ namespace NorthwindPhoto
         private string _selectedControl;
         private float incrementDirection = 1.0f;
 
+        // begin IoT support
+        private const int BUTTON_PIN = 4;
+        private GpioPin _buttonPin;
+
+        private const string SPI_CONTROLLER_NAME = "SPI0";  /* Friendly name for Raspberry Pi 2 SPI controller          */
+        private const Int32 SPI_CHIP_SELECT_LINE = 0;       /* Line 0 maps to physical pin number 24 on the Rpi2        */
+        private Adc _adc = new Adc();
+
+        private Timer periodicTimer;
+        //private int adcValue;
+        //private int _lastAdcValue;
+        private float jitter = 0.10f;
+
+        private readonly byte[] MCP3008_CONFIG0 = { 0x01, 0x80 }; /* 00000001 10000000 channel configuration data for the MCP3008 */
+        private readonly byte[] MCP3008_CONFIG1= { 0x01, 0x80 }; /* 00000001 10000000 channel configuration data for the MCP3008 */
+        // end IoT support
+
         public ImageEditingPage()
         {
             InitializeComponent();
             Window.Current.CoreWindow.KeyDown += CoreWindow_KeyDown;
             Window.Current.CoreWindow.KeyUp += CoreWindow_KeyUp;
+            InitializeIot();
+        }
+        private void Page_Loaded(object sender, RoutedEventArgs e)
+        {
+            periodicTimer = new Timer(this.Timer_Tick, null, 0, 100);
         }
 
         private void CoreWindow_KeyUp(Windows.UI.Core.CoreWindow sender, Windows.UI.Core.KeyEventArgs args)
@@ -85,6 +109,103 @@ namespace NorthwindPhoto
             else if (key == VirtualKey.Control)
             {
                 incrementDirection = -1.0f;
+            }
+        }
+
+        private void InitializeIot()
+        {
+            InitializeGpio();
+        }
+
+        const int BlurChannel = 0;
+        const int SaturationChannel = 2;
+        const int ExposureChannel = 4;
+        const int ContrastChannel = 6;
+
+        private void Timer_Tick(object state)
+        {
+            float blurDial = ReadDial(BlurChannel, _blur);
+            float saturationDial = ReadDial(SaturationChannel, _saturation);
+            float exposureDial = ReadDial(ExposureChannel, _exposure);
+            float contrastDial = ReadDial(ContrastChannel, _contrast);
+
+            bool update = false;
+            if (blurDial != _blur)
+            {
+                _blur = blurDial * 10;
+                update = true;
+            }
+            if (saturationDial != _saturation)
+            {
+                _saturation = saturationDial;
+                update = true;
+            }
+            if (exposureDial != _exposure)
+            {
+                _exposure = exposureDial;
+                update = true;
+            }
+            if (contrastDial != _contrast)
+            {
+                _contrast = contrastDial;
+                update = true;
+            }
+            if (update)
+            {
+                var task = this.Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
+                {
+                    CreateEffects();
+                });
+            }
+        }
+
+        public float ReadDial(byte channel, float current)
+        {
+            float result = current;
+            int intValue = _adc.GetValueFromChannel(channel);
+            float value = intValue / 1024.0f;
+            if ((value >= (current + jitter)) ||
+                (value <= (current - jitter)))
+            {
+                result = value;
+            }
+            return result;
+        }
+
+        private void InitializeGpio()
+        {
+            if (_buttonPin != null)
+                return;
+
+            var gpio = GpioController.GetDefault();
+            if (gpio != null)
+            {
+                _buttonPin = gpio.OpenPin(BUTTON_PIN);
+
+                // Check if input pull-up resistors are supported
+                if (_buttonPin.IsDriveModeSupported(GpioPinDriveMode.InputPullUp))
+                    _buttonPin.SetDriveMode(GpioPinDriveMode.InputPullUp);
+                else
+                    _buttonPin.SetDriveMode(GpioPinDriveMode.Input);
+
+                // Set a debounce timeout to filter out switch bounce noise from a button press
+                _buttonPin.DebounceTimeout = TimeSpan.FromMilliseconds(50);
+
+                // Register for the ValueChanged event so our _buttonPin_ValueChanged 
+                // function is called when the button is pressed
+                _buttonPin.ValueChanged += _buttonPin_ValueChanged;
+            }
+        }
+
+        private async void _buttonPin_ValueChanged(GpioPin sender, GpioPinValueChangedEventArgs args)
+        {
+            if (args.Edge == GpioPinEdge.FallingEdge)
+            {
+                await Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
+                {
+                    if (App.MainFrame.CanGoBack)
+                        App.MainFrame.GoBack();
+                });
             }
         }
 
@@ -117,8 +238,11 @@ namespace NorthwindPhoto
             }
 
             _effect.Dispose();
+            _effect = null;
             _canvasBitmap.Dispose();
+            _canvasBitmap = null;
             _canvasRenderTarget.Dispose();
+            _canvasRenderTarget = null;
         }
 
         /// <summary>
@@ -207,6 +331,26 @@ namespace NorthwindPhoto
                 var increment = CalculateIncrements(args);
                 IncrementValue(increment);
             }
+        }
+
+        private void SetValue(float value)
+        {
+            switch (_selectedControl)
+            {
+                case "Contrast":
+                    _contrast = value;
+                    break;
+                case "Saturation":
+                    _saturation = value;
+                    break;
+                case "Exposure":
+                    _exposure = value;
+                    break;
+                case "Blur":
+                    _blur = value*10;
+                    break;
+            }
+            CreateEffects();
         }
 
         private void IncrementValue(float increment)
@@ -476,8 +620,11 @@ namespace NorthwindPhoto
 
         private void CreateEffects()
         {
-            _canvasRenderTarget = new CanvasRenderTarget(CanvasControl, (float)Window.Current.Bounds.Width,
-                (float)Window.Current.Bounds.Height, _canvasBitmap.Dpi);
+            if (_canvasBitmap == null)
+                return;
+
+            if (_canvasRenderTarget == null)
+                return;
 
             using (var ds = _canvasRenderTarget.CreateDrawingSession())
             {
@@ -507,6 +654,9 @@ namespace NorthwindPhoto
                 Contrast = _contrast,
                 Source = saturation
             };
+
+            if (_effect != null)
+                _effect.Dispose();
 
             _effect = contrast;
             CanvasControl.Invalidate();
